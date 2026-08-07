@@ -85,5 +85,10 @@ async function handleStatus(args: StatusArgs, runtime: AcpRuntime, ctx: Extensio
     // (merged oldest-first, with mixed-range breakdowns).
     extra.push(formatRanges(ranges, protectedRanges));
   }
+  const activeBlocks = state.blocks.filter((b) => b.active).length;
+  if (activeBlocks >= 2) {
+    extra.push("");
+    extra.push(`Tip: ${activeBlocks} compressed block(s) \u2014 search_context({ query: "..." }) can locate specific content across them before decompressing.`);
+  }
   return extra.length > 0 ? `${base}\n${extra.join("\n")}` : base;
 }
