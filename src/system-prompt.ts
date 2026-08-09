@@ -59,6 +59,16 @@ ${TIER2_DISTILL_RULES}
 
 ${TIER3_CONDENSE_RULES}
 
+WHEN TO SEARCH
+
+- Content you need is not in the visible context (compressed or buried) — search reaches original message text directly, independent of summary quality.
+- You know what you are looking for but not which block holds it (cross-block topics, multi-tier distillation) — one search covers all blocks and buried messages; search before decompress to locate the right block.
+- Before asserting an exact fact (path, signature, version, number) that is not in visible context — verify via search (then decompress if needed).
+
+WHEN NOT TO SEARCH
+
+- Content is already visible — read it directly. You already know the block or message ref — decompress it directly.
+
 THE PHILOSOPHY OF DECOMPRESS
 
 decompress restores previously compressed content and writes it to a file by default (use inline:true to return it in the tool result instead). The compressed block stays folded (its summary remains in place), so the cache prefix is preserved and context is minimally disrupted. Use decompress when you need exact details lost in compression. Before decompressing, use search_context to find the right block.
