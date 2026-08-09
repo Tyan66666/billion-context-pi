@@ -453,7 +453,7 @@ async function runDelegate(
     });
     child.stderr?.on("data", (c: Buffer) => {
       stderrText += c.toString("utf8");
-      outStream.write(Buffer.concat([STDERR_PREFIX, c]));
+      outStream.write(prefixStderrChunk(c));
     });
     const run: DelegateRun = {
       runId,
@@ -487,22 +487,17 @@ async function runDelegate(
           return;
         }
         let resultFile = "";
-        if (streamFailed) {
-          // The stream errored mid-run (disk full, etc.) — fall back to the
-          // original one-shot overwrite so the final file is still complete.
-          resultFile = await persistResult(runId, body);
-        } else {
-          try {
-            const st = await stat(file);
-            if (st.size === 0) {
-              // No output at all — match the "(no output)" body semantics.
-              await writeFile(file, "(no output)", "utf8");
-            }
-            resultFile = file;
-          } catch (err) {
-            debug.event("delegate-stream-finalize-error", { runId, file, error: String(err) });
-            resultFile = await persistResult(runId, body);
+        if (!streamFailed) {
+          resultFile = await ensureStreamedFile(file);
+        }
+        if (streamFailed || !resultFile) {
+          // Stream errored (disk full, etc.) or never produced the file —
+          // fall back to the original one-shot overwrite so the final result
+          // is still complete.
+          if (!streamFailed) {
+            debug.event("delegate-stream-finalize-error", { runId, file });
           }
+          resultFile = await persistResult(runId, body);
         }
         // Atomically flip status + result together: until this point the run
         // is still "running" to any observer, so a concurrent wait cannot
@@ -737,6 +732,27 @@ async function persistResult(runId: string, body: string): Promise<string> {
     return file;
   } catch (err) {
     debug.event("delegate-persist-error", { runId, file, error: String(err) });
+    return "";
+  }
+}
+
+/** Prefix a stderr chunk so streamed output keeps stdout/stderr distinguishable. */
+export function prefixStderrChunk(chunk: Buffer): Buffer {
+  return Buffer.concat([STDERR_PREFIX, chunk]);
+}
+
+/** Ensure a streamed output file is a readable result: pad a zero-byte file
+ *  with "(no output)" so an empty run still leaves a file behind. Returns the
+ *  file path, or "" when the file is missing (the stream never created it) —
+ *  the caller then falls back to persistResult. */
+export async function ensureStreamedFile(file: string): Promise<string> {
+  try {
+    const st = await stat(file);
+    if (st.size === 0) {
+      await writeFile(file, "(no output)", "utf8");
+    }
+    return file;
+  } catch {
     return "";
   }
 }
