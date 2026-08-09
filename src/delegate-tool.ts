@@ -551,6 +551,7 @@ async function runDelegate(
       `Delegated to **${args.agent}** (runId \`${runId}\`).`,
       `Task: ${truncate(args.task, 160)}`,
       `Running in the background at \`${cwd}\`.`,
+      `Live output is streaming to \`${file}\` — you can \`read\` it anytime for progress (it keeps growing until the delegate finishes).`,
       ``,
       `Call acp_delegate_wait({ runId: "${runId}" }) to block for the result (default 10s timeout). If the wait times out, or you skip it, a completion notification (with the result file path) is still injected here automatically when the delegate finishes — so you may also just continue other work now and let the result find you.`,
     ].join("\n");
