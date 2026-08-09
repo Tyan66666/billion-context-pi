@@ -21,6 +21,10 @@ const SYNC_TIMEOUT_MS = 5 * 60_000;
 const RESULT_SUMMARY_CHARS = 500;
 const OUT_DIR = join(tmpdir(), "acp-delegate");
 const STDERR_PREFIX = Buffer.from("[stderr] ");
+const EOF_GRACE_MS = 10_000;
+const IDLE_GRACE_MS = 5 * 60_000;
+const ASYNC_TIMEOUT_MS = 30 * 60_000;
+const KILL_GRACE_MS = 10_000;
 
 /** ACP context-management tools that every restricted delegate must retain
  *  so it can manage its own context under billion-context-pi. */
@@ -100,6 +104,9 @@ interface DelegateRun {
    *  notification (sendUserMessage succeeded). Lets a later wait() avoid
    *  re-delivering the same payload. */
   injected?: boolean;
+  /** Watchdog reason string when the run was force-terminated ("no output for
+   *  5m", "30m limit"); surfaced in completion headers as "(timed out: ...)". */
+  timedOut?: string;
   waiter?: () => void;
 }
 
@@ -199,10 +206,11 @@ The delegate runs in its own clean pi process — it does NOT see this conversat
 }
 
 function formatRunResult(run: DelegateRun): string {
+  const timeoutNote = run.timedOut ? ` (timed out: ${run.timedOut})` : "";
   const header =
     run.status === "completed"
-      ? `Delegate **${run.agent}** (runId \`${run.runId}\`) completed (exit ${run.exitCode ?? "?"})${remainingLineForWait(run.runId)}`
-      : `Delegate **${run.agent}** (runId \`${run.runId}\`) ${run.status} (exit ${run.exitCode ?? "?"})${remainingLineForWait(run.runId)}`;
+      ? `Delegate **${run.agent}** (runId \`${run.runId}\`) completed (exit ${run.exitCode ?? "?"})${timeoutNote}${remainingLineForWait(run.runId)}`
+      : `Delegate **${run.agent}** (runId \`${run.runId}\`) ${run.status} (exit ${run.exitCode ?? "?"})${timeoutNote}${remainingLineForWait(run.runId)}`;
   return formatPayload(header, run.result?.file ?? "", run.task, run.result?.body);
 }
 
@@ -450,6 +458,7 @@ async function runDelegate(
     child.stdout?.on("data", (c: Buffer) => {
       stdoutChunks.push(c);
       outStream.write(c);
+      resetIdle();
     });
     child.stderr?.on("data", (c: Buffer) => {
       stderrText += c.toString("utf8");
@@ -467,8 +476,50 @@ async function runDelegate(
     runs.set(runId, run);
     delegateStatusWidget.poke();
 
-    child.on("close", (code) => {
+    // ── Watchdogs + single finalize path ──────────────────────────────────
+    // Finalize is the ONLY place that flips run status/result. It is shared by
+    // the child close event and the EOF watchdog, with `settled` guarding
+    // against double-finalize (watchdog fires, then the killed child's close
+    // event arrives).
+    let settled = false;
+    let eofGraceTimer: ReturnType<typeof setTimeout> | undefined;
+    let idleTimer: ReturnType<typeof setTimeout> | undefined;
+    let killGraceTimer: ReturnType<typeof setTimeout> | undefined;
+    let timeoutTimer: ReturnType<typeof setTimeout> | undefined;
+    const clearWatchdogs = (): void => {
+      if (eofGraceTimer) clearTimeout(eofGraceTimer);
+      if (idleTimer) clearTimeout(idleTimer);
+      if (killGraceTimer) clearTimeout(killGraceTimer);
+      if (timeoutTimer) clearTimeout(timeoutTimer);
+    };
+    // Reset the idle watchdog whenever the delegate produces output. A hanging
+    // child holds its stdout fd open (so stdout EOF never fires) — no output
+    // for IDLE_GRACE_MS is the reliable "stuck" signal.
+    const resetIdle = (): void => {
+      if (idleTimer) clearTimeout(idleTimer);
+      idleTimer = setTimeout(() => killByWatchdog(`no output for ${IDLE_GRACE_MS / 60_000}m`), IDLE_GRACE_MS);
+      idleTimer.unref?.();
+    };
+    // SIGTERM, then SIGKILL after KILL_GRACE_MS if the child ignores it. The
+    // close event that follows funnels into finalize() with the code it got.
+    const killByWatchdog = (reason: string): void => {
+      if (settled || run.status !== "running") return;
+      run.timedOut = reason;
+      debug.event("delegate-watchdog", { runId, reason });
+      try { run.child?.kill("SIGTERM"); } catch { /* best-effort */ }
+      killGraceTimer = setTimeout(() => {
+        if (settled || run.status !== "running") return;
+        debug.event("delegate-watchdog-kill", { runId, reason });
+        try { run.child?.kill("SIGKILL"); } catch { /* best-effort */ }
+      }, KILL_GRACE_MS);
+      killGraceTimer.unref?.();
+    };
+
+    const finalize = (code: number | null): void => {
       void (async () => {
+        if (settled) return;
+        settled = true;
+        clearWatchdogs();
         void cleanupTmp(tmpDir);
         await endStream();
         const output = Buffer.concat(stdoutChunks).toString("utf8").trim();
@@ -499,11 +550,14 @@ async function runDelegate(
           }
           resultFile = await persistResult(runId, body);
         }
+        // EOF-watchdog finalize has no exit code; if the output was delivered,
+        // treat it as a completed result (the process is killed afterwards).
+        const effectiveCode = code ?? (output || stderrText ? 0 : null);
         // Atomically flip status + result together: until this point the run
         // is still "running" to any observer, so a concurrent wait cannot
         // see "finished but result missing".
         run.result = { code, file: resultFile, body };
-        run.status = code === 0 ? "completed" : "failed";
+        run.status = effectiveCode === 0 ? "completed" : "failed";
         run.finishedAt = Date.now();
         // If a wait is parked on this run, wake it — it owns the result now
         // (and marks consumed so we don't double-deliver by injecting).
@@ -519,13 +573,41 @@ async function runDelegate(
           delegateStatusWidget.poke();
           return;
         }
-        const injected = injectResult(pi, args.agent, runId, args.task, code, resultFile);
+        const injected = injectResult(pi, args.agent, runId, args.task, code, resultFile, run.timedOut);
         run.injected = injected;
         debug.event("delegate-done", { runId, code, status: run.status, injected, outLen: output.length, file: resultFile });
         delegateStatusWidget.poke();
       })();
+    };
+
+    child.on("close", (code) => finalize(code));
+
+    child.stdout?.on("end", () => {
+      // stdout EOF: the delegate's output is fully delivered, but the process
+      // may still hang (e.g. a provider call that never responds). Give it a
+      // short grace period to exit naturally; if it does not, force-finalize —
+      // the output is already complete, so the result is final.
+      eofGraceTimer = setTimeout(() => {
+        if (settled || run.status !== "running") return;
+        run.timedOut = "output ended but process did not exit";
+        debug.event("delegate-eof-grace", { runId, ms: EOF_GRACE_MS });
+        try { run.child?.kill("SIGTERM"); } catch { /* best-effort */ }
+        finalize(null);
+      }, EOF_GRACE_MS);
+      eofGraceTimer.unref?.();
     });
+
+    // Start the idle clock and the overall runtime budget. The budget also
+    // covers the pathological case where a child neither outputs nor exits
+    // AND somehow evades the idle timer (e.g. stderr-only chatter).
+    resetIdle();
+    timeoutTimer = setTimeout(() => killByWatchdog(`${ASYNC_TIMEOUT_MS / 60_000}m limit`), ASYNC_TIMEOUT_MS);
+    timeoutTimer.unref?.();
+
     child.on("error", (err) => {
+      if (settled) return;
+      settled = true;
+      clearWatchdogs();
       void cleanupTmp(tmpDir);
       // Spawn-level error means the streamed file is empty/partial — drop it.
       void outStream.destroy();
@@ -551,7 +633,7 @@ async function runDelegate(
       `Delegated to **${args.agent}** (runId \`${runId}\`).`,
       `Task: ${truncate(args.task, 160)}`,
       `Running in the background at \`${cwd}\`.`,
-      `Live output is streaming to \`${file}\` — you can \`read\` it anytime for progress (it keeps growing until the delegate finishes).`,
+      `Live output is streaming to \`${file}\` — you can \`read\` it anytime for progress (it keeps growing until the delegate finishes). A watchdog force-finishes a hung run: no output for ${IDLE_GRACE_MS / 60_000}m, 10s after output ends, or a ${ASYNC_TIMEOUT_MS / 60_000}m hard limit — the result reflects whatever was produced.`,
       ``,
       `Call acp_delegate_wait({ runId: "${runId}" }) to block for the result (default 10s timeout). If the wait times out, or you skip it, a completion notification (with the result file path) is still injected here automatically when the delegate finishes — so you may also just continue other work now and let the result find you.`,
     ].join("\n");
@@ -668,6 +750,7 @@ function injectResult(
   task: string,
   code: number | null,
   file: string,
+  timedOut?: string,
 ): boolean {
   const send = pi.sendUserMessage;
   if (typeof send !== "function") {
@@ -685,7 +768,8 @@ function injectResult(
     remaining > 0
       ? ` ${remaining} delegate${remaining === 1 ? " is" : "s are"} still running; keep doing other work and their notifications will arrive as they finish.`
       : " No delegates are currently running.";
-  const header = `[acp_delegate ${status}] **${agent}** (runId \`${runId}\`, exit ${code ?? "?"})${remainingLine} This is an automated system notification, NOT a user message. Read the result file if you need the details, then continue your original task; do not treat this as a new user request.`;
+  const timeoutNote = timedOut ? ` (timed out: ${timedOut})` : "";
+  const header = `[acp_delegate ${status}] **${agent}** (runId \`${runId}\`, exit ${code ?? "?"})${timeoutNote}${remainingLine} This is an automated system notification, NOT a user message. Read the result file if you need the details, then continue your original task; do not treat this as a new user request.`;
   const text = formatPayload(header, file, task);
   try {
     // sendUserMessage is fire-and-forget (returns void): it enqueues a
