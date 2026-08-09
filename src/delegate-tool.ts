@@ -2,7 +2,8 @@ import {
   spawn,
   type ChildProcess,
 } from "node:child_process";
-import { mkdir, mkdtemp, writeFile, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, writeFile, rm, stat } from "node:fs/promises";
+import { createWriteStream } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Type, type Static } from "typebox";
@@ -19,6 +20,7 @@ const MAX_DEPTH = 2;
 const SYNC_TIMEOUT_MS = 5 * 60_000;
 const RESULT_SUMMARY_CHARS = 500;
 const OUT_DIR = join(tmpdir(), "acp-delegate");
+const STDERR_PREFIX = Buffer.from("[stderr] ");
 
 /** ACP context-management tools that every restricted delegate must retain
  *  so it can manage its own context under billion-context-pi. */
@@ -423,9 +425,35 @@ async function runDelegate(
   const startedAt = Date.now();
 
   if (isAsync) {
-    child.stdout?.on("data", (c: Buffer) => stdoutChunks.push(c));
+    // Stream the delegate's live stdout+stderr to OUT_DIR/<runId>.out while it
+    // runs, so both the user (tail -f) and the host model (read) can watch
+    // progress. stderr chunks are prefixed to stay distinguishable. The final
+    // file IS the streamed content; the in-memory buffers below only feed the
+    // chat payload (status + 500-char preview) once the child closes.
+    await mkdir(OUT_DIR, { recursive: true }).catch(() => undefined);
+    const file = join(OUT_DIR, `${runId}.out`);
+    const outStream = createWriteStream(file, { flags: "w" });
+    let streamFailed = false;
+    outStream.on("error", (err: Error) => {
+      streamFailed = true;
+      debug.event("delegate-stream-error", { runId, file, error: String(err) });
+    });
+    const endStream = () =>
+      new Promise<void>((resolve) => {
+        if (outStream.destroyed || outStream.closed) {
+          resolve();
+          return;
+        }
+        outStream.end(() => resolve());
+      });
+
+    child.stdout?.on("data", (c: Buffer) => {
+      stdoutChunks.push(c);
+      outStream.write(c);
+    });
     child.stderr?.on("data", (c: Buffer) => {
       stderrText += c.toString("utf8");
+      outStream.write(Buffer.concat([STDERR_PREFIX, c]));
     });
     const run: DelegateRun = {
       runId,
@@ -440,58 +468,73 @@ async function runDelegate(
     delegateStatusWidget.poke();
 
     child.on("close", (code) => {
-      void cleanupTmp(tmpDir);
-      const output = Buffer.concat(stdoutChunks).toString("utf8").trim();
-      run.exitCode = code;
-      const body = code === 0 ? (output || "(no output)") : (stderrText.trim() || output || "(no output)");
-      // N2: cancelled runs never persist a result — wake a parked waiter (if any)
-      // and stop. status stays "cancelled" (set by cancel), so wait cannot
-      // mistake it for a finished-with-result run.
-      if (run.status === "cancelled") {
-        run.finishedAt = Date.now();
-        debug.event("delegate-done", { runId, code, status: run.status, injected: false, outLen: output.length });
-        run.waiter?.();
-        delegateStatusWidget.poke();
-        return;
-      }
-      void persistResult(runId, body)
-        .then((file) => {
-          // Atomically flip status + result together: until this point the run
-          // is still "running" to any observer, so a concurrent wait cannot
-          // see "finished but result missing".
-          run.result = { code, file, body };
-          run.status = code === 0 ? "completed" : "failed";
+      void (async () => {
+        void cleanupTmp(tmpDir);
+        await endStream();
+        const output = Buffer.concat(stdoutChunks).toString("utf8").trim();
+        run.exitCode = code;
+        const body = code === 0 ? (output || "(no output)") : (stderrText.trim() || output || "(no output)");
+        // N2: cancelled runs never persist a result — wake a parked waiter (if any)
+        // and stop. status stays "cancelled" (set by cancel), so wait cannot
+        // mistake it for a finished-with-result run.
+        if (run.status === "cancelled") {
           run.finishedAt = Date.now();
-          // If a wait is parked on this run, wake it — it owns the result now
-          // (and marks consumed so we don't double-deliver by injecting).
-          if (run.waiter) {
-            debug.event("delegate-done", { runId, code, status: run.status, injected: false, via: "wait", outLen: output.length, file });
-            run.waiter();
-            delegateStatusWidget.poke();
-            return;
-          }
-          // If a wait already returned this result, skip the injection.
-          if (run.consumed) {
-            debug.event("delegate-done", { runId, code, status: run.status, injected: false, via: "consumed", outLen: output.length, file });
-            delegateStatusWidget.poke();
-            return;
-          }
-          const injected = injectResult(pi, args.agent, runId, args.task, code, file);
-          run.injected = injected;
-          debug.event("delegate-done", { runId, code, status: run.status, injected, outLen: output.length, file });
-          delegateStatusWidget.poke();
-        })
-        .catch((err) => {
-          // Persist failed — still need to finalize so a waiter doesn't hang.
-          run.status = "failed";
-          run.finishedAt = Date.now();
-          debug.event("delegate-done-error", { runId, error: String(err) });
+          debug.event("delegate-done", { runId, code, status: run.status, injected: false, outLen: output.length });
+          // Remove the partially-streamed file — cancelled runs leave nothing behind.
+          await rm(file, { force: true }).catch(() => undefined);
           run.waiter?.();
           delegateStatusWidget.poke();
-        });
+          return;
+        }
+        let resultFile = "";
+        if (streamFailed) {
+          // The stream errored mid-run (disk full, etc.) — fall back to the
+          // original one-shot overwrite so the final file is still complete.
+          resultFile = await persistResult(runId, body);
+        } else {
+          try {
+            const st = await stat(file);
+            if (st.size === 0) {
+              // No output at all — match the "(no output)" body semantics.
+              await writeFile(file, "(no output)", "utf8");
+            }
+            resultFile = file;
+          } catch (err) {
+            debug.event("delegate-stream-finalize-error", { runId, file, error: String(err) });
+            resultFile = await persistResult(runId, body);
+          }
+        }
+        // Atomically flip status + result together: until this point the run
+        // is still "running" to any observer, so a concurrent wait cannot
+        // see "finished but result missing".
+        run.result = { code, file: resultFile, body };
+        run.status = code === 0 ? "completed" : "failed";
+        run.finishedAt = Date.now();
+        // If a wait is parked on this run, wake it — it owns the result now
+        // (and marks consumed so we don't double-deliver by injecting).
+        if (run.waiter) {
+          debug.event("delegate-done", { runId, code, status: run.status, injected: false, via: "wait", outLen: output.length, file: resultFile });
+          run.waiter();
+          delegateStatusWidget.poke();
+          return;
+        }
+        // If a wait already returned this result, skip the injection.
+        if (run.consumed) {
+          debug.event("delegate-done", { runId, code, status: run.status, injected: false, via: "consumed", outLen: output.length, file: resultFile });
+          delegateStatusWidget.poke();
+          return;
+        }
+        const injected = injectResult(pi, args.agent, runId, args.task, code, resultFile);
+        run.injected = injected;
+        debug.event("delegate-done", { runId, code, status: run.status, injected, outLen: output.length, file: resultFile });
+        delegateStatusWidget.poke();
+      })();
     });
     child.on("error", (err) => {
       void cleanupTmp(tmpDir);
+      // Spawn-level error means the streamed file is empty/partial — drop it.
+      void outStream.destroy();
+      void rm(file, { force: true }).catch(() => undefined);
       // Spawn-level error (e.g. EPIPE on a fast-exiting child, ENOENT).
       // Node does not guarantee a follow-up close, so finalize here too:
       // atomically set status + a synthetic result, and wake a parked waiter.

@@ -32,7 +32,7 @@ function renderLines(runs: WidgetRun[]): string[] | undefined {
     : `acp_delegate · ${runs.length} running`;
   const rows = runs.map((r) => {
     const elapsed = Math.max(0, Math.round((now - r.startedAt) / 1000));
-    return `  ● ${r.agent} (${elapsed}s) — ${truncateTask(r.task)}`;
+    return `  ● ${r.agent} (${elapsed}s) [${r.runId}] — ${truncateTask(r.task)}`;
   });
   return [header, ...rows];
 }
